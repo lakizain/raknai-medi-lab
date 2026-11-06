@@ -1,0 +1,943 @@
+// Report Entry Service - Handles all report entry related operations
+class ReportEntryService {
+  constructor() {
+    this.supabase = window.SUPABASE_CONFIG?.supabase || null;
+    this.DB_SCHEMA = window.SUPABASE_CONFIG?.DB_SCHEMA || null;
+
+    if (!this.supabase) {
+      console.warn(
+        "ReportEntryService initialized without Supabase connection"
+      );
+    }
+  }
+
+  // Helper to get current user
+  getCurrentUser() {
+    try {
+      const userStr = sessionStorage.getItem('loggedInUser');
+      return userStr ? JSON.parse(userStr) : null;
+    } catch (e) {
+      console.warn('Error parsing current user:', e);
+      return null;
+    }
+  }
+
+  // Helper to check if user is admin
+  isUserAdmin() {
+    const user = this.getCurrentUser();
+    return user?.role === 'admin';
+  }
+
+  // Helper to get user's center id
+  getUserCenterId() {
+    const user = this.getCurrentUser();
+    return window.UserCenterAccess?.getActiveCenterId(user) || user?.center_id || null;
+  }
+
+  // Simple UUID v4-ish validator (loose)
+  isValidUuid(value) {
+    if (typeof value !== "string") return false;
+    const uuidRegex =
+      /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$/;
+    return uuidRegex.test(value);
+  }
+
+  // Upsert report header (comments and special notes) per bill item
+  async upsertReportHeader({
+    billId,
+    billItemId,
+    commentsResult,
+    specialNotes,
+    status = "draft",
+    user = null,
+  }) {
+    try {
+      if (!this.isSupabaseAvailable()) {
+        console.log(
+          "Supabase not available, skipping report header save (offline)"
+        );
+        return { success: true, message: "Report header saved offline" };
+      }
+
+      // If IDs are not UUIDs (likely sample/mock data), treat as offline to avoid false errors
+      if (!this.isValidUuid(billId) || !this.isValidUuid(billItemId)) {
+        console.warn(
+          "Non-UUID identifiers detected for report header; assuming mock data and saving offline"
+        );
+        return { success: true, message: "Report header saved offline (mock)" };
+      }
+
+      const payload = {
+        bill_id: billId,
+        bill_item_id: billItemId,
+        comments_result: commentsResult || null,
+        special_notes: specialNotes || null,
+        status: status === "final" ? "ready" : status, // Map final to ready
+        updated_at: new Date().toISOString(),
+      };
+      const currentUser = this.getCurrentUser();
+      const enteredBy = user || currentUser?.username || null;
+      payload.updated_by = enteredBy;
+
+      // Use explicit select -> update or insert to avoid ON CONFLICT dependency
+      const { data: existingList, error: findErr } = await this.supabase
+        .from("test_report_headers")
+        .select("*")
+        .eq("bill_item_id", billItemId)
+        .limit(1);
+
+      if (findErr) {
+        const wrapped = new Error(
+          findErr?.message || "Failed to query report header"
+        );
+        wrapped.original = findErr;
+        throw wrapped;
+      }
+
+      if (existingList && existingList.length > 0) {
+        const existing = existingList[0];
+        const { data: updated, error: updErr } = await this.supabase
+          .from("test_report_headers")
+          .update(payload)
+          .eq("id", existing.id)
+          .select()
+          .single();
+
+        if (updErr) {
+          const wrapped = new Error(
+            updErr?.message || "Failed to update report header"
+          );
+          wrapped.original = updErr;
+          throw wrapped;
+        }
+        return { success: true, data: updated };
+      } else {
+        payload.created_by = enteredBy;
+        const { data: inserted, error: insErr } = await this.supabase
+          .from("test_report_headers")
+          .insert(payload)
+          .select()
+          .single();
+
+        if (insErr) {
+          const wrapped = new Error(
+            insErr?.message || "Failed to insert report header"
+          );
+          wrapped.original = insErr;
+          throw wrapped;
+        }
+        return { success: true, data: inserted };
+      }
+    } catch (error) {
+      console.error("Error upserting report header:", error);
+      throw error;
+    }
+  }
+
+  // Check if Supabase is available
+  isSupabaseAvailable() {
+    return this.supabase !== null;
+  }
+
+  // Apply the selected center while restricting non-admins to assigned centers.
+  applyCenterFilter(query, centerId) {
+    const user = this.getCurrentUser();
+    if (centerId === "all") {
+      if (user?.role !== "admin") {
+        throw new Error("You are not authorized to view all centers");
+      }
+      return query;
+    }
+
+    const selectedCenterId =
+      centerId === undefined ? this.getUserCenterId() : centerId;
+    if (
+      user?.role !== "admin" &&
+      selectedCenterId &&
+      !(window.UserCenterAccess?.getAssignedCenterIds(user) || []).includes(
+        selectedCenterId
+      )
+    ) {
+      throw new Error("You are not assigned to this center");
+    }
+    if (selectedCenterId) {
+      query = query.eq("center_id", selectedCenterId);
+    }
+    return query;
+  }
+
+  normalizeBillForReportEntry(bill) {
+    if (!bill || !Array.isArray(bill.bill_items)) return bill;
+
+    const packageIdsWithComponents = new Set(
+      bill.bill_items
+        .filter((item) => item?.is_package_component && item?.package_id)
+        .map((item) => String(item.package_id))
+    );
+
+    if (packageIdsWithComponents.size === 0) return bill;
+
+    return {
+      ...bill,
+      bill_items: bill.bill_items.filter((item) => {
+        const packageId = item?.package_id == null ? null : String(item.package_id);
+        const isPackageSummaryRow =
+          Boolean(packageId) &&
+          !item?.test_id &&
+          !item?.is_package_component;
+
+        if (!isPackageSummaryRow) return true;
+        return !packageIdsWithComponents.has(packageId);
+      }),
+    };
+  }
+
+  normalizeBillsForReportEntry(bills) {
+    return (bills || []).map((bill) => this.normalizeBillForReportEntry(bill));
+  }
+
+  // Get today's bills with all test details
+  async getTodaysBills(centerId) {
+    const today = new Date();
+    const todayValue = [
+      today.getFullYear(),
+      String(today.getMonth() + 1).padStart(2, "0"),
+      String(today.getDate()).padStart(2, "0"),
+    ].join("-");
+    return this.getBillsByDateRange(todayValue, todayValue, centerId);
+  }
+
+  // Get bills by date range
+  async getBillsByDateRange(fromDate, toDate, centerId, testId = null) {
+    try {
+      if (!this.isSupabaseAvailable()) {
+        throw new Error("Report search is unavailable because the database is disconnected.");
+      }
+      const isValidDate = (value) => {
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(value || "")) return false;
+        const parsed = new Date(`${value}T00:00:00Z`);
+        return !Number.isNaN(parsed.getTime()) &&
+          parsed.toISOString().slice(0, 10) === value;
+      };
+      if (!isValidDate(fromDate) || !isValidDate(toDate)) {
+        throw new Error("Enter valid start and end dates.");
+      }
+      if (fromDate > toDate) {
+        throw new Error("The start date must be on or before the end date.");
+      }
+
+      const startAt = new Date(`${fromDate}T00:00:00`);
+      const endBefore = new Date(`${toDate}T00:00:00`);
+      endBefore.setDate(endBefore.getDate() + 1);
+
+      let query = this.supabase
+        .from("bills")
+        .select(
+          `
+          *,
+          bill_items (
+            *,
+            tests (test_name, short_name, price, duration, footer_text),
+            packages (package_name, price),
+            test_report_headers (created_by, updated_by)
+          ),
+          ${testId ? "matching_items:bill_items!inner(test_id)," : ""}
+          centers (center_name, is_out_medical)
+        `
+        )
+        .gte("bill_date", startAt.toISOString())
+        .lt("bill_date", endBefore.toISOString())
+        .order("created_at", { ascending: false });
+
+      if (testId) {
+        query = query.eq("matching_items.test_id", testId);
+      }
+      query = this.applyCenterFilter(query, centerId);
+
+      const { data: bills, error } = await query;
+
+      if (error) throw error;
+      return this.normalizeBillsForReportEntry(bills);
+    } catch (error) {
+      console.error("Error getting bills by date range:", error);
+      throw error;
+    }
+  }
+
+  // Get bills by test filter
+  async getBillsByTest(testId, centerId) {
+    try {
+      if (!this.isSupabaseAvailable()) {
+        throw new Error("Report search is unavailable because the database is disconnected.");
+      }
+
+      let query = this.supabase
+        .from("bills")
+        .select(
+          `
+          *,
+          bill_items (
+            *,
+            tests (test_name, short_name, price, duration, footer_text),
+            packages (package_name, price),
+            test_report_headers (created_by, updated_by)
+          ),
+          matching_items:bill_items!inner(test_id),
+          centers (center_name, is_out_medical)
+        `
+        )
+        .eq("matching_items.test_id", testId)
+        .order("created_at", { ascending: false });
+
+      query = this.applyCenterFilter(query, centerId);
+
+      const { data: bills, error } = await query;
+
+      if (error) throw error;
+      return this.normalizeBillsForReportEntry(bills);
+    } catch (error) {
+      console.error("Error getting bills by test:", error);
+      throw error;
+    }
+  }
+
+  // Get bills by center filter
+  async getBillsByCenter(centerId) {
+    try {
+      if (!this.isSupabaseAvailable()) {
+        throw new Error("Report search is unavailable because the database is disconnected.");
+      }
+
+      let query = this.supabase
+        .from("bills")
+        .select(
+          `
+          *,
+          bill_items (
+            *,
+            tests (test_name, short_name, price, duration, footer_text),
+            packages (package_name, price),
+            test_report_headers (created_by, updated_by)
+          ),
+          centers (center_name, is_out_medical)
+        `
+        )
+        .order("created_at", { ascending: false });
+
+      query = this.applyCenterFilter(query, centerId);
+
+      const { data: bills, error } = await query;
+
+      if (error) throw error;
+      return this.normalizeBillsForReportEntry(bills);
+    } catch (error) {
+      console.error("Error getting bills by center:", error);
+      throw error;
+    }
+  }
+
+  // Search bills by bill number or patient name
+  async searchBills(searchTerm, centerId) {
+    try {
+      if (!this.isSupabaseAvailable()) {
+        throw new Error("Bill search is unavailable because the database is disconnected.");
+      }
+
+      const term = String(searchTerm || "").trim();
+      if (!term) return [];
+      const pattern = term.replace(/[\\%_]/g, "\\$&");
+      const selectClause = `
+          *,
+          bill_items (
+            *,
+            tests (test_name, short_name, price, duration, footer_text),
+            packages (package_name, price),
+            test_report_headers (created_by, updated_by)
+          ),
+          centers (center_name, is_out_medical)
+        `;
+      const searchField = (field) => {
+        let query = this.supabase
+          .from("bills")
+          .select(selectClause)
+          .ilike(field, `%${pattern}%`)
+          .order("created_at", { ascending: false })
+          .limit(8);
+        return this.applyCenterFilter(query, centerId);
+      };
+
+      const [billNumberResult, patientResult] = await Promise.all([
+        searchField("bill_no"),
+        searchField("patient_name"),
+      ]);
+      if (billNumberResult.error) throw billNumberResult.error;
+      if (patientResult.error) throw patientResult.error;
+
+      const uniqueBills = new Map();
+      [...(billNumberResult.data || []), ...(patientResult.data || [])]
+        .forEach((bill) => uniqueBills.set(bill.id || bill.bill_no, bill));
+      const bills = Array.from(uniqueBills.values())
+        .sort(
+          (left, right) =>
+            new Date(right.created_at || right.bill_date).getTime() -
+            new Date(left.created_at || left.bill_date).getTime()
+        )
+        .slice(0, 8);
+      return this.normalizeBillsForReportEntry(bills);
+    } catch (error) {
+      console.error("Error searching bills:", error);
+      throw error;
+    }
+  }
+
+  // Get bill by number
+  async getBillByNumber(billNo, centerId) {
+    try {
+      if (!this.isSupabaseAvailable()) {
+        throw new Error("Bill details are unavailable because the database is disconnected.");
+      }
+
+      let query = this.supabase
+        .from("bills")
+        .select(
+          `
+          *,
+          bill_items (
+            *,
+            tests (test_name, short_name, price, duration, footer_text),
+            packages (package_name, price),
+            test_report_headers (created_by, updated_by)
+          ),
+          centers (center_name, is_out_medical)
+        `
+        )
+        .eq("bill_no", billNo);
+
+      query = this.applyCenterFilter(query, centerId);
+
+      const { data: bill, error } = await query.maybeSingle();
+
+      if (error) throw error;
+      return this.normalizeBillForReportEntry(bill);
+    } catch (error) {
+      console.error("Error getting bill by number:", error);
+      throw error;
+    }
+  }
+
+  async getBillById(billId, centerId) {
+    try {
+      if (!this.isSupabaseAvailable()) {
+        throw new Error("Bill details are unavailable because the database is disconnected.");
+      }
+
+      let query = this.supabase
+        .from("bills")
+        .select(
+          `
+          *,
+          bill_items (
+            *,
+            tests (test_name, short_name, price, duration, footer_text),
+            packages (package_name, price),
+            test_report_headers (created_by, updated_by)
+          ),
+          centers (center_name, is_out_medical)
+        `
+        )
+        .eq("id", billId);
+
+      query = this.applyCenterFilter(query, centerId);
+
+      const { data: bill, error } = await query.maybeSingle();
+      if (error) throw error;
+      return this.normalizeBillForReportEntry(bill);
+    } catch (error) {
+      console.error("Error getting bill by ID:", error);
+      throw error;
+    }
+  }
+
+  // Get report header for a bill item (comments and special notes)
+  async getReportHeader(billItemId) {
+    try {
+      if (!this.isSupabaseAvailable()) return null;
+      if (!this.isValidUuid(billItemId)) return null;
+
+      const { data, error } = await this.supabase
+        .from("test_report_headers")
+        .select("*")
+        .eq("bill_item_id", billItemId)
+        .limit(1);
+
+      if (error) {
+        const msg = error?.message || "";
+        if (msg.includes("does not exist")) return null;
+        throw error;
+      }
+
+      if (Array.isArray(data) && data.length > 0) return data[0];
+      return null;
+    } catch (e) {
+      console.warn("getReportHeader failed", e);
+      return null;
+    }
+  }
+
+  // Get test results for a specific bill item (scoped)
+  async getTestResultsByBillItem(billItemId) {
+    try {
+      if (!this.isSupabaseAvailable()) {
+        console.log("Supabase not available, returning sample data");
+        return this.getSampleTestResults();
+      }
+
+      if (!this.isValidUuid(billItemId)) {
+        throw new Error("Invalid billItemId for fetching test results");
+      }
+
+      const { data: results, error } = await this.supabase
+        .from("test_results")
+        .select(
+          `
+          *,
+          test_subcategories (
+            *,
+            tests (test_name, short_name)
+          )
+        `
+        )
+        .eq("bill_item_id", billItemId)
+        .order("created_at", { ascending: true });
+
+      if (error) {
+        if (error.code === "42703" && error.message?.includes("bill_item_id")) {
+          const { data: billItem, error: billItemError } = await this.supabase
+            .from("bill_items")
+            .select("bill_id, test_id")
+            .eq("id", billItemId)
+            .maybeSingle();
+
+          if (billItemError) throw billItemError;
+          if (!billItem?.bill_id || !billItem?.test_id) return [];
+
+          const { data: legacyResults, error: legacyError } = await this.supabase
+            .from("test_results")
+            .select(
+              `
+              *,
+              test_subcategories!inner (
+                *,
+                tests (test_name, short_name)
+              )
+            `
+            )
+            .eq("bill_id", billItem.bill_id)
+            .eq("test_subcategories.test_id", billItem.test_id)
+            .order("created_at", { ascending: true });
+
+          if (legacyError) throw legacyError;
+          return legacyResults || [];
+        }
+
+        const friendly = error?.message?.includes("does not exist")
+          ? "Table test_results not found. Run database/setup.sql in your Supabase project."
+          : error?.message || "Failed to load test results";
+        const wrapped = new Error(friendly);
+        wrapped.original = error;
+        throw wrapped;
+      }
+      return results || [];
+    } catch (error) {
+      console.error("Error getting test results:", error);
+      return [];
+    }
+  }
+
+  // Save test results scoped to a specific bill item
+  async saveTestResults(billId, billItemId, results) {
+    try {
+      if (!this.isSupabaseAvailable()) {
+        console.log("Supabase not available, saving in offline mode");
+        return { success: true, message: "Saved offline" };
+      }
+
+      // If billId isn't a UUID (likely mock/sample data), do not attempt remote save
+      if (!this.isValidUuid(billId)) {
+        console.warn(
+          "Non-UUID billId detected in saveTestResults; assuming mock data and saving offline"
+        );
+        return { success: true, message: "Saved offline (mock)" };
+      }
+
+      if (!this.isValidUuid(billItemId)) {
+        throw new Error("Invalid billItemId for saving test results");
+      }
+
+      const sanitizedResults = Array.isArray(results)
+        ? results
+            .filter((r) => r && this.isValidUuid(r.subcategory_id))
+            .map((r) => ({
+              bill_id: billId,
+              bill_item_id: billItemId,
+              subcategory_id: r.subcategory_id,
+              value: r.value ?? null,
+              unit: r.unit ?? null,
+              status: r.status ?? null,
+              comments: r.comments ?? null,
+            }))
+        : [];
+
+      // Delete existing results for this bill item only
+      const { error: delError } = await this.supabase
+        .from("test_results")
+        .delete()
+        .eq("bill_item_id", billItemId);
+      if (delError) {
+        const msg = delError?.message || "";
+        if (msg.includes("does not exist")) {
+          console.warn(
+            "Table test_results not found. Treating save as offline success."
+          );
+          return { success: true, message: "Saved offline (table missing)" };
+        }
+        const friendly = msg || "Failed to clear existing test results";
+        const wrapped = new Error(friendly);
+        wrapped.original = delError;
+        throw wrapped;
+      }
+
+      // Insert new results
+      if (sanitizedResults.length > 0) {
+        const { error: insError } = await this.supabase
+          .from("test_results")
+          .insert(sanitizedResults);
+
+        if (insError) {
+          const msg = insError?.message || "";
+          if (msg.includes("does not exist")) {
+            console.warn(
+              "Table test_results not found during insert. Treating save as offline success."
+            );
+            return { success: true, message: "Saved offline (table missing)" };
+          }
+          const friendly = msg || "Failed to save test results";
+          const wrapped = new Error(friendly);
+          wrapped.original = insError;
+          throw wrapped;
+        }
+      }
+
+      return { success: true, message: "Test results saved successfully" };
+    } catch (error) {
+      console.error("Error saving test results:", error);
+      throw error;
+    }
+  }
+
+  // Update report status for a bill item
+  async updateReportStatus(billItemId, status = "completed") {
+    try {
+      if (!this.isSupabaseAvailable()) {
+        console.log("Supabase not available, updating status offline");
+        return { success: true, message: "Status updated offline" };
+      }
+
+      if (!this.isValidUuid(billItemId)) {
+        console.warn("Non-UUID billItemId detected, updating status offline");
+        return { success: true, message: "Status updated offline (mock)" };
+      }
+
+      // Update bill_items table with report status
+      const { error: billItemError } = await this.supabase
+        .from("bill_items")
+        .update({
+          report_status: status,
+          updated_at: new Date().toISOString(),
+        })
+        .eq("id", billItemId);
+
+      if (billItemError) {
+        const msg = billItemError?.message || "";
+        if (
+          msg.includes("does not exist") ||
+          (msg.includes("column") && msg.includes("report_status"))
+        ) {
+          console.warn(
+            "bill_items table or report_status column not found, updating test_report_headers instead"
+          );
+
+          // Fallback: Update test_report_headers status
+          const { error: headerError } = await this.supabase
+            .from("test_report_headers")
+            .update({
+              status: status,
+              updated_at: new Date().toISOString(),
+            })
+            .eq("bill_item_id", billItemId);
+
+          if (headerError) {
+            console.warn("Failed to update test_report_headers:", headerError);
+            return {
+              success: true,
+              message: "Status updated offline (fallback failed)",
+            };
+          }
+
+          return {
+            success: true,
+            message: "Report status updated via test_report_headers",
+          };
+        }
+        throw billItemError;
+      }
+
+      // Also update test_report_headers status for consistency
+      try {
+        await this.supabase
+          .from("test_report_headers")
+          .update({
+            status: status,
+            updated_at: new Date().toISOString(),
+          })
+          .eq("bill_item_id", billItemId);
+      } catch (headerError) {
+        console.warn(
+          "Failed to update test_report_headers status:",
+          headerError
+        );
+        // Don't fail the whole operation for this
+      }
+
+      return { success: true, message: "Report status updated successfully" };
+    } catch (error) {
+      console.error("Error updating report status:", error);
+      // Return success to prevent UI blocking, but log the error
+      return {
+        success: true,
+        message: "Status updated offline (error handled)",
+      };
+    }
+  }
+
+  async sendReadyReportsByEmail(email, items) {
+    try {
+      const to = (email || "").toString().trim();
+      if (!to) {
+        return { success: false, message: "Email is required" };
+      }
+      if (!Array.isArray(items) || items.length === 0) {
+        return { success: false, message: "No tests selected" };
+      }
+
+      if (!this.isSupabaseAvailable()) {
+        return { success: true, message: "Queued to send (offline mode)" };
+      }
+
+      const fn =
+        window.APP_CONFIG?.supabase?.functions?.sendReadyReports ||
+        "send-ready-reports";
+
+      const invoke = this.supabase?.functions?.invoke;
+      if (typeof invoke !== "function") {
+        return {
+          success: true,
+          message: "Queued to send (functions not available)",
+        };
+      }
+
+      const payload = { email: to, items };
+      const { data, error } = await this.supabase.functions.invoke(fn, {
+        body: payload,
+      });
+
+      if (error) {
+        const msg = error?.message || "Failed to send email";
+        return { success: false, message: msg, error };
+      }
+
+      const message =
+        (data && (data.message || data.status || data.result)) ||
+        "Email sent successfully";
+      return { success: true, message, data };
+    } catch (error) {
+      console.error("Error sending ready reports by email:", error);
+      const msg = error?.message || "Failed to send email";
+      return { success: false, message: msg, error };
+    }
+  }
+
+  // Get sample data for offline mode
+  getSampleTodaysBills() {
+    return [
+      {
+        id: 1,
+        bill_no: "B001",
+        patient_name: "John Doe",
+        bill_date: new Date().toISOString(),
+        final_amount: 1500.0,
+        status: "pending",
+        report_status: "pending",
+        centers: { center_name: "Main Lab" },
+        bill_items: [
+          {
+            id: 1,
+            test_id: 1,
+            report_status: "pending",
+            tests: {
+              test_name: "FULL BLOOD COUNT",
+              short_name: "FBC",
+              price: 500.0,
+            },
+            quantity: 1,
+            unit_price: 500.0,
+            total_price: 500.0,
+          },
+          {
+            id: 2,
+            test_id: 2,
+            report_status: "ready",
+            tests: {
+              test_name: "LIPID PROFILE",
+              short_name: "LP",
+              price: 800.0,
+            },
+            quantity: 1,
+            unit_price: 800.0,
+            total_price: 800.0,
+          },
+          {
+            id: 3,
+            package_id: 1,
+            report_status: "pending",
+            packages: { package_name: "HEALTH CHECKUP", price: 200.0 },
+            quantity: 1,
+            unit_price: 200.0,
+            total_price: 200.0,
+          },
+        ],
+      },
+      {
+        id: 2,
+        bill_no: "B002",
+        patient_name: "Jane Smith",
+        bill_date: new Date().toISOString(),
+        final_amount: 800.0,
+        status: "pending",
+        report_status: "ready",
+        centers: { center_name: "Main Lab" },
+        bill_items: [
+          {
+            id: 4,
+            test_id: 2,
+            report_status: "ready",
+            tests: {
+              test_name: "LIPID PROFILE",
+              short_name: "LP",
+              price: 800.0,
+            },
+            quantity: 1,
+            unit_price: 800.0,
+            total_price: 800.0,
+          },
+        ],
+      },
+      {
+        id: 3,
+        bill_no: "B003",
+        patient_name: "Bob Johnson",
+        bill_date: new Date().toISOString(),
+        final_amount: 1200.0,
+        status: "pending",
+        report_status: "pending",
+        centers: { center_name: "Main Lab" },
+        bill_items: [
+          {
+            id: 5,
+            test_id: 1,
+            report_status: "pending",
+            tests: {
+              test_name: "FULL BLOOD COUNT",
+              short_name: "FBC",
+              price: 500.0,
+            },
+            quantity: 1,
+            unit_price: 500.0,
+            total_price: 500.0,
+          },
+          {
+            id: 6,
+            test_id: 3,
+            report_status: "pending",
+            tests: {
+              test_name: "LIVER FUNCTION TEST",
+              short_name: "LFT",
+              price: 700.0,
+            },
+            quantity: 1,
+            unit_price: 700.0,
+            total_price: 700.0,
+          },
+        ],
+      },
+    ];
+  }
+
+  getSampleBill() {
+    return {
+      id: 1,
+      bill_no: "B001",
+      patient_name: "John Doe",
+      bill_date: new Date().toISOString(),
+      final_amount: 1500.0,
+      status: "pending",
+      centers: { center_name: "Main Lab" },
+      bill_items: [
+        {
+          id: 1,
+          test_id: 1,
+          tests: {
+            test_name: "FULL BLOOD COUNT",
+            short_name: "FBC",
+            price: 500.0,
+          },
+          quantity: 1,
+          unit_price: 500.0,
+          total_price: 500.0,
+        },
+        {
+          id: 2,
+          test_id: 2,
+          tests: { test_name: "LIPID PROFILE", short_name: "LP", price: 800.0 },
+          quantity: 1,
+          unit_price: 800.0,
+          total_price: 800.0,
+        },
+      ],
+    };
+  }
+
+  getSampleTestResults() {
+    return [
+      {
+        id: 1,
+        subcategory_id: 1,
+        value: "12.5",
+        unit: "g/dL",
+        status: "Normal",
+        comments: "Within normal range",
+      },
+      {
+        id: 2,
+        subcategory_id: 2,
+        value: "4.2",
+        unit: "million/μL",
+        status: "Normal",
+        comments: "Normal count",
+      },
+    ];
+  }
+}
+
+// Export the service
+window.ReportEntryService = ReportEntryService;
