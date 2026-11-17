@@ -36,12 +36,8 @@
     header.className = "labs-nav";
     header.innerHTML = `
       <div class="labs-nav__inner">
-        <a class="labs-nav__brand" href="dashboard.html" aria-label="Suwajeewa Laboratories dashboard">
-          <img src="Imgs/suwajeewa_logo.png" alt="">
-          <span>
-            <strong>SUWAJEEWA</strong>
-            <small>Laboratory System</small>
-          </span>
+        <a class="labs-nav__brand" href="dashboard.html" aria-label="RAKNAI-MEDI-LAB dashboard">
+          <img src="Imgs/RAKNAI-MEDI-LAB.png" alt="RAKNAI-MEDI-LAB">
         </a>
         <button class="labs-nav__toggle" type="button" aria-expanded="false" aria-controls="labs-nav-links">
           <span class="labs-nav__toggle-icon" aria-hidden="true"></span>
